@@ -1,6 +1,514 @@
-dit-repo/
-   ├── tracker.py
-   ├── requirements.txt
-   └── .github/
-       └── workflows/
-           └── daily-update.yml
+#!/usr/bin/env python3
+"""
+Tech & Politik Nyhedstracker
+=============================
+Udviklet til Innovation Centre Denmark / Det Danske Generalkonsulat.
+
+Formål:
+    Hver morgen (via GitHub Actions) hentes de seneste 24 timers artikler
+    fra en kurateret liste af RSS-feeds inden for tech, tech-politik og
+    regulering. Resultatet samles i en statisk index.html, som hostes
+    gratis via GitHub Pages.
+
+Arkitektur:
+    Kilder (RSS) --> dette script (kører i GitHub Actions) --> index.html
+    --> committes til repo --> serveres af GitHub Pages
+
+Ingen API-nøgler. Ingen betalte tjenester. Kun feedparser + standardbiblioteket.
+"""
+
+import feedparser
+import html
+import logging
+import os
+import socket
+import ssl
+import sys
+import time
+import urllib.request
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
+
+# ---------------------------------------------------------------------------
+# 1. KONFIGURATION
+# ---------------------------------------------------------------------------
+
+# Hvor mange timer bagud skal vi kigge? 30 timer i stedet for 24 giver en
+# buffer, så vi ikke mister artikler hvis et cron-job en dag kører lidt sent,
+# eller hvis en kilde er langsom til at opdatere sit feed.
+HOURS_LOOKBACK = int(os.environ.get("HOURS_LOOKBACK", "30"))
+
+# Timeout pr. feed-hentning (sekunder). Vigtigt: uden dette kan ét dødt
+# feed i teorien få hele jobbet til at hænge og ramme GitHub Actions' loft.
+FEED_TIMEOUT = 12
+
+# Maks. antal artikler vist pr. kilde, så én meget aktiv kilde ikke
+# druknner resten af briefingen.
+MAX_PER_SOURCE = 6
+
+# En "rigtig" browser User-Agent. Flere medier (bl.a. Wired/Condé Nast)
+# blokerer eller begrænser requests uden denne.
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 "
+    "TechPolitikTracker/1.0 (+intern konsulat-briefing; kontakt: se README)"
+)
+
+OUTPUT_FILE = "index.html"
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger("tracker")
+
+
+# ---------------------------------------------------------------------------
+# 2. KILDER
+# ---------------------------------------------------------------------------
+# Struktur: kategori -> liste af (visningsnavn, feed-url)
+#
+# NB om kilder uden stabilt gratis RSS-feed (Reuters, Washington Post,
+# Bloomberg, The Information m.fl. har enten lukket deres offentlige RSS
+# eller lægger indhold bag login): disse dækkes i stedet via Google News'
+# gratis, nøglefri RSS-søgning (se build_google_news_feed nedenfor).
+# Det er ikke lige så præcist som et nativt feed, men det er 100% gratis,
+# kræver ingen konto, og fanger stadig overskrifter + links.
+#
+# Ret/udvid frit denne liste — det er her, redaktionel prioritering sker.
+
+def google_news_feed(query: str, lang="en-US", country="US") -> str:
+    """Bygger et gratis, nøglefrit Google News RSS-feed for en søgning.
+    Bruges som fallback for medier uden eget offentligt RSS-feed."""
+    q = query.replace(" ", "+")
+    return (
+        f"https://news.google.com/rss/search?q={q}"
+        f"&hl={lang}&gl={country}&ceid={country}:{lang.split('-')[0].upper()}"
+    )
+
+
+SOURCES = {
+    "Big Tech & Silicon Valley": [
+        ("TechCrunch", "https://techcrunch.com/feed/"),
+        ("The Verge", "https://www.theverge.com/rss/index.xml"),
+        ("Wired", "https://www.wired.com/feed/rss"),
+        ("Ars Technica", "https://feeds.arstechnica.com/arstechnica/index"),
+        ("VentureBeat", "https://venturebeat.com/feed/"),
+        ("MIT Technology Review", "https://www.technologyreview.com/feed/"),
+        ("The Information (via Google News)",
+         google_news_feed("site:theinformation.com")),
+    ],
+    "Tech-politik, regulering & geopolitik": [
+        ("Ars Technica – Policy", "https://feeds.arstechnica.com/arstechnica/policy"),
+        ("Politico – Digital Future / Tech (via Google News)",
+         google_news_feed("site:politico.com technology OR tech policy OR digital future")),
+        ("Reuters – Technology (via Google News)",
+         google_news_feed("site:reuters.com technology")),
+        ("Financial Times – Technology (via Google News)",
+         google_news_feed("site:ft.com technology")),
+        ("Bloomberg – Technology (via Google News)",
+         google_news_feed("site:bloomberg.com technology")),
+        ("Washington Post – Technology (via Google News)",
+         google_news_feed("site:washingtonpost.com technology")),
+        ("New York Times – Technology", "https://rss.nytimes.com/services/xml/rss/nyt/Technology.xml"),
+    ],
+    "Analyse & kommentar": [
+        ("Stratechery (Ben Thompson)", "https://stratechery.com/feed/"),
+        ("Platformer (Casey Newton)", "https://www.platformer.news/feed"),
+        ("Rest of World", "https://restofworld.org/feed/"),
+    ],
+    "Dansk & europæisk vinkel": [
+        ("Version2", "https://www.version2.dk/feed"),
+        ("Computerworld DK", "https://www.computerworld.dk/rss/nyheder"),
+        ("Mandag Morgen", "https://www.mm.dk/feed/"),
+        ("EU tech-politik (via Google News)",
+         google_news_feed("EU technology regulation OR \"digital policy\"", country="DK")),
+    ],
+}
+
+
+# ---------------------------------------------------------------------------
+# 3. HENTNING AF FEEDS
+# ---------------------------------------------------------------------------
+
+def fetch_feed(url: str):
+    """Henter og parser ét RSS-feed. Returnerer feedparser-objekt eller None
+    ved fejl. Fejler ALDRIG hårdt — en enkelt død kilde må ikke vælte hele
+    kørslen (se krav om robusthed/fejlhåndtering)."""
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+        # ssl-context der bruger systemets rod-certifikater; undgår
+        # certifikatfejl på nogle CI-runnere uden at slå verifikation fra.
+        ctx = ssl.create_default_context()
+        with urllib.request.urlopen(req, timeout=FEED_TIMEOUT, context=ctx) as resp:
+            raw = resp.read()
+        parsed = feedparser.parse(raw)
+        if parsed.bozo and not parsed.entries:
+            # bozo=1 betyder "feedet er ikke helt velformet XML". Vi
+            # accepterer det stiltiende, SÅ LÆNGE der stadig kunne
+            # udtrækkes artikler — mange feeds er "beskidte" men brugbare.
+            raise ValueError(f"Uparsérbart feed (bozo): {parsed.bozo_exception}")
+        return parsed
+    except (urllib.error.URLError, socket.timeout, ValueError, TimeoutError) as e:
+        log.warning(f"  Kunne ikke hente feed ({url}): {e}")
+        return None
+    except Exception as e:  # sidste sikkerhedsnet — log og fortsæt
+        log.warning(f"  Uventet fejl ved feed ({url}): {e}")
+        return None
+
+
+def parse_entry_date(entry):
+    """Prøver flere strategier for at finde en artikels udgivelsestidspunkt,
+    da feeds er notorisk inkonsistente i formattering."""
+    for field in ("published_parsed", "updated_parsed"):
+        val = entry.get(field)
+        if val:
+            try:
+                return datetime.fromtimestamp(time.mktime(val), tz=timezone.utc)
+            except (OverflowError, ValueError):
+                pass
+    for field in ("published", "updated"):
+        val = entry.get(field)
+        if val:
+            try:
+                return parsedate_to_datetime(val).astimezone(timezone.utc)
+            except Exception:
+                pass
+    return None  # ukendt dato — artiklen sorteres/filtreres konservativt
+
+
+def collect_articles():
+    """Gennemløber alle kilder, henter og filtrerer artikler fra de
+    seneste HOURS_LOOKBACK timer. Returnerer struktur klar til HTML-generering
+    samt statistik til logging/fejlsøgning."""
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=HOURS_LOOKBACK)
+    results = {}
+    stats = {"ok": 0, "failed": 0, "articles": 0}
+
+    for category, sources in SOURCES.items():
+        log.info(f"Kategori: {category}")
+        results[category] = []
+        for name, url in sources:
+            parsed = fetch_feed(url)
+            if parsed is None or not parsed.entries:
+                stats["failed"] += 1
+                continue
+            stats["ok"] += 1
+
+            fresh = []
+            for entry in parsed.entries:
+                pub_date = parse_entry_date(entry)
+                # Artikler uden genkendelig dato springes over frem for at
+                # risikere at fylde briefingen med gammelt indhold.
+                if pub_date is None or pub_date < cutoff:
+                    continue
+                title = html.unescape(entry.get("title", "Uden titel")).strip()
+                link = entry.get("link", "#")
+                if not title or link == "#":
+                    continue
+                fresh.append({
+                    "title": title,
+                    "link": link,
+                    "published": pub_date,
+                    "source": name,
+                })
+
+            fresh.sort(key=lambda a: a["published"], reverse=True)
+            deduped, seen_links = [], set()
+            for a in fresh:
+                if a["link"] in seen_links:
+                    continue
+                seen_links.add(a["link"])
+                deduped.append(a)
+
+            results[category].extend(deduped[:MAX_PER_SOURCE])
+            stats["articles"] += len(deduped[:MAX_PER_SOURCE])
+            log.info(f"  {name}: {len(deduped[:MAX_PER_SOURCE])} artikler")
+
+        results[category].sort(key=lambda a: a["published"], reverse=True)
+
+    return results, stats
+
+
+# ---------------------------------------------------------------------------
+# 4. HTML-GENERERING
+# ---------------------------------------------------------------------------
+
+PAGE_TEMPLATE = """<!DOCTYPE html>
+<html lang="da">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Tech & Politik Nyhedstracker — Innovation Centre Denmark</title>
+<style>
+  :root {{
+    --navy: #0b1f3a;
+    --navy-light: #16305a;
+    --paper: #f7f5ef;
+    --ink: #1a1a1a;
+    --muted: #6b6f76;
+    --red: #c8102e;
+    --rule: #d8d4c8;
+  }}
+  * {{ box-sizing: border-box; }}
+  body {{
+    margin: 0;
+    background: var(--paper);
+    color: var(--ink);
+    font-family: -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
+    line-height: 1.45;
+  }}
+  header {{
+    background: var(--navy);
+    color: #fff;
+    padding: 28px 24px 22px;
+    border-bottom: 4px solid var(--red);
+  }}
+  header .eyebrow {{
+    font-family: "Courier New", monospace;
+    font-size: 12px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: #9fb3d1;
+    margin: 0 0 6px;
+  }}
+  header h1 {{
+    margin: 0 0 4px;
+    font-size: 26px;
+    font-weight: 700;
+    letter-spacing: -0.01em;
+  }}
+  header p.meta {{
+    margin: 0;
+    font-size: 13px;
+    color: #c2ccdc;
+    font-family: "Courier New", monospace;
+  }}
+  main {{
+    max-width: 880px;
+    margin: 0 auto;
+    padding: 32px 24px 64px;
+  }}
+  .category {{
+    margin-bottom: 40px;
+  }}
+  .category h2 {{
+    font-size: 15px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--navy);
+    border-bottom: 2px solid var(--rule);
+    padding-bottom: 8px;
+    margin: 0 0 4px;
+  }}
+  .empty-note {{
+    color: var(--muted);
+    font-size: 13px;
+    font-style: italic;
+    padding: 10px 0;
+  }}
+  article.item {{
+    padding: 14px 0;
+    border-bottom: 1px solid var(--rule);
+  }}
+  article.item:last-child {{ border-bottom: none; }}
+  article.item a.title {{
+    color: var(--ink);
+    text-decoration: none;
+    font-size: 17px;
+    font-weight: 600;
+    display: block;
+    margin-bottom: 4px;
+  }}
+  article.item a.title:hover {{ color: var(--red); text-decoration: underline; }}
+  .item-meta {{
+    font-size: 12px;
+    color: var(--muted);
+    font-family: "Courier New", monospace;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }}
+  footer {{
+    max-width: 880px;
+    margin: 0 auto;
+    padding: 0 24px 40px;
+    font-size: 12px;
+    color: var(--muted);
+    font-family: "Courier New", monospace;
+  }}
+</style>
+</head>
+<body>
+<header>
+  <p class="eyebrow">Innovation Centre Denmark · Silicon Valley</p>
+  <h1>Tech & Politik Nyhedstracker</h1>
+  <p class="meta">Genereret {generated_at} UTC &nbsp;·&nbsp; Dækker seneste {lookback} timer &nbsp;·&nbsp; {n_articles} artikler fra {n_ok} kilder ({n_failed} kilder utilgængelige)</p>
+</header>
+<main>
+{body}
+</main>
+<footer>
+  Automatisk genereret af tracker.py via GitHub Actions. Ingen redaktionel kuratering — alle artikler er maskinelt udvalgt ud fra RSS-metadata.
+</footer>
+</body>
+</html>
+"""
+
+CATEGORY_TEMPLATE = """<section class="category">
+  <h2>{category}</h2>
+  {items}
+</section>
+"""
+
+ITEM_TEMPLATE = """<article class="item">
+  <a class="title" href="{link}" target="_blank" rel="noopener noreferrer">{title}</a>
+  <div class="item-meta">{source} &nbsp;·&nbsp; {time_ago}</div>
+</article>
+"""
+
+
+def time_ago(pub_date: datetime) -> str:
+    delta = datetime.now(timezone.utc) - pub_date
+    hours = int(delta.total_seconds() // 3600)
+    if hours < 1:
+        return "for under en time siden"
+    if hours == 1:
+        return "for 1 time siden"
+    return f"for {hours} timer siden"
+
+
+def render_html(results: dict, stats: dict) -> str:
+    body_parts = []
+    for category, articles in results.items():
+        if not articles:
+            items_html = '<p class="empty-note">Ingen nye artikler i denne kategori i dag.</p>'
+        else:
+            items_html = "\n".join(
+                ITEM_TEMPLATE.format(
+                    link=html.escape(a["link"]),
+                    title=html.escape(a["title"]),
+                    source=html.escape(a["source"]),
+                    time_ago=time_ago(a["published"]),
+                )
+                for a in articles
+            )
+        body_parts.append(CATEGORY_TEMPLATE.format(category=html.escape(category), items=items_html))
+
+    return PAGE_TEMPLATE.format(
+        generated_at=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M"),
+        lookback=HOURS_LOOKBACK,
+        n_articles=stats["articles"],
+        n_ok=stats["ok"],
+        n_failed=stats["failed"],
+        body="\n".join(body_parts),
+    )
+
+
+# ---------------------------------------------------------------------------
+# 5. MAIN
+# ---------------------------------------------------------------------------
+
+def main():
+    log.info("Starter Tech & Politik Nyhedstracker …")
+    results, stats = collect_articles()
+    log.info(
+        f"Færdig: {stats['ok']} kilder OK, {stats['failed']} fejlede, "
+        f"{stats['articles']} artikler i alt."
+    )
+
+    html_out = render_html(results, stats)
+    with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
+        f.write(html_out)
+    log.info(f"Skrev {OUTPUT_FILE}")
+
+    # Hvis samtlige kilder fejlede, er der sandsynligvis noget galt med
+    # netværket i CI-miljøet snarere end med de enkelte feeds. Vi lader
+    # scriptet fejle synligt (exit 1), så GitHub Actions markerer kørslen
+    # som fejlet, i stedet for stiltiende at committe en tom side.
+    if stats["ok"] == 0:
+        log.error("Alle kilder fejlede — afbryder uden at overskrive index.html.")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
+
+    feedparser==6.0.11
+    name: Daily Tech & Politik Update
+
+on:
+  schedule:
+    # GitHub Actions' cron kører altid i UTC, og der findes intet
+    # "lokal tid"-flag. Californien skifter mellem UTC-7 (PDT, sommer)
+    # og UTC-8 (PST, vinter), så vi lægger to cron-linjer ind for at
+    # ramme kl. 07:00 lokal tid året rundt:
+    #   - 14:00 UTC dækker sommertid (PDT, marts–november)
+    #   - 15:00 UTC dækker vintertid (PST, november–marts)
+    # Scriptet nedenfor tjekker selv, hvilket af de to skud der reelt
+    # svarer til "lige nu i Californien", og springer det forkerte over.
+    - cron: "0 14 * * *"
+    - cron: "0 15 * * *"
+  # Gør det muligt at trigge en kørsel manuelt fra Actions-fanen,
+  # fx til test eller hvis man vil have en frisk briefing uden for skema.
+  workflow_dispatch: {}
+
+permissions:
+  contents: write  # nødvendigt for at kunne committe index.html tilbage
+
+concurrency:
+  group: tracker-update
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10  # sikkerhedsnet: intet enkelt job skal kunne hænge for evigt
+
+    steps:
+      - name: Skip hvis forkert cron-skud (DST-guard)
+        id: dst_check
+        run: |
+          # Beregn nuværende klokkeslæt i Los Angeles-tidszonen og afbryd
+          # jobbet stille, hvis det ikke reelt er omkring kl. 07 lokal tid.
+          # (Ved manuel trigger via workflow_dispatch køres altid.)
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          LOCAL_HOUR=$(TZ="America/Los_Angeles" date +%H)
+          if [ "$LOCAL_HOUR" = "07" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "Springer over — lokal tid i Californien er $LOCAL_HOUR, ikke 07."
+          fi
+
+      - name: Checkout repository
+        if: steps.dst_check.outputs.run == 'true'
+        uses: actions/checkout@v4
+
+      - name: Sæt Python op
+        if: steps.dst_check.outputs.run == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Installér afhængigheder
+        if: steps.dst_check.outputs.run == 'true'
+        run: pip install -r requirements.txt
+
+      - name: Kør tracker.py
+        if: steps.dst_check.outputs.run == 'true'
+        run: python tracker.py
+
+      - name: Committer og pusher opdateret index.html
+        if: steps.dst_check.outputs.run == 'true'
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "🤖 Automatisk opdatering af nyhedstracker"
+          file_pattern: "index.html"
+          commit_user_name: "tech-politik-tracker-bot"
+          commit_user_email: "actions@github.com"
+          
